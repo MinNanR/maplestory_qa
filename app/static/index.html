@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Game Knowledge QA</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="layout">
+    <section class="panel">
+      <div class="panel-header">
+        <h1>本地游戏知识问答</h1>
+        <button id="reloadBtn" class="button secondary">重载知识库</button>
+      </div>
+      <div id="chatMessages" class="chat-messages"></div>
+      <div class="composer">
+        <label class="label" for="question">输入问题</label>
+        <textarea id="question" placeholder="例如：狂战士的怒焰斩在满层怒气时倍率怎么计算？"></textarea>
+        <div class="actions">
+          <button id="askBtn" class="button primary">发送</button>
+          <button id="searchBtn" class="button secondary">仅检索</button>
+        </div>
+      </div>
+      <div class="result-block">
+        <h2>最近一次引用资料</h2>
+        <div id="sources" class="sources"></div>
+      </div>
+    </section>
+
+    <aside class="panel side-panel">
+      <div class="panel-header">
+        <h2>知识条目</h2>
+      </div>
+      <div id="entries" class="entries"></div>
+    </aside>
+  </main>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
