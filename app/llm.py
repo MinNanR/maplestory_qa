@@ -19,6 +19,8 @@ SYSTEM_PROMPT = """你是一个游戏知识问答助手。
 
 class LLMClient:
     def __init__(self, base_url: str, api_key: str, model: str):
+        if not api_key.strip():
+            raise ValueError("LLM API key is required. Set LLM_API_KEY or the provider-specific key.")
         self.client = OpenAI(base_url=base_url, api_key=api_key)
         self.model = model
 

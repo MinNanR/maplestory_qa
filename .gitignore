@@ -1,0 +1,10 @@
+.env
+**/__pycache__/
+/.dsh/
+/.edge-cdp/
+/.idea/
+/.venv/
+/_raw/
+/turn/
+/run_dir/**
+/scripts

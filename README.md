@@ -100,3 +100,17 @@ tags:
 - 把最近几轮对话历史一起发给模型
 
 这样像“那满怒的时候呢”这类省略主语的问题也能接住。
+
+## 6. backend 知识检索与上下文控制
+
+`backend/` 下 `/api/chat/stream` 链路用两处本地检索控制上下文长度（零新增依赖）：
+
+- **意图解析（`backend/analysis/query_analyzer.py`）**：不再把整份知识库目录（`build_catalog()`，会随知识库线性增长）塞进提示词；改为先用本地检索（`backend/knowledge/retrieval.py` 的 BM25-风格打分，词元 = 英文单词 + 中文单字）从目录条目（title/description/keyword）筛出少量候选，只把压缩后的候选清单（默认 15 条）交给 LLM 选 `knowledge_ids`，提示词大小与知识库总量解耦。
+- **知识注入（`backend/conversation/context.py`）**：不再把命中文档全文拼入 system 消息；文档先按标题结构分块（`backend/knowledge/chunker.py`，过小块合并、超大块按段落硬切），回答时按当前问题（含最近两轮用户问题用于指代消解）从**会话知识池**内截取相关片段注入，总量受 `knowledge_max_chars`（默认 6000 字符）预算约束。
+  - 会话知识池跨轮累积、按文档去重：历史轮次解析出的知识（如塞伦机制）在后续追问（如「那阿黛尔怎么应对」）中仍会被注入，每个池内文档至少保留其最高分片段；
+  - 池内文档数超过 `knowledge_pool_max_docs`（默认 6）时淘汰最旧文档；
+  - 单轮不需要知识（闲聊）时不注入，但池保留供后续使用。
+
+相关配置项见 `backend/config.py`（`.env` 可覆盖），如 `retrieval_top_docs` / `chunk_top_k` / `chunk_min_chars` / `chunk_max_chars` / `knowledge_max_chars` / `knowledge_pool_max_docs`。检索演示：`python -m backend.knowledge.retrieval --query "虎影 Bravado 技能效果" --top 5`。知识库文件变更（新增/修改文档）后，索引在下一次调用时按 mtime 指纹自动重建，无需重启服务。
+
+注意：上面的第 1~5 节描述的是旧版 `app/` 原型；当前生效的实现为 `backend/` 包（`uvicorn backend.main:app` 启动，静态页在 `frontend/`）。

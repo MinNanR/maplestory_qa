@@ -11,12 +11,16 @@
     <section class="panel">
       <div class="panel-header">
         <h1>本地游戏知识问答</h1>
-        <button id="reloadBtn" class="button secondary">重载知识库</button>
+        <div class="header-actions">
+          <button id="newChatBtn" class="button secondary">新建对话</button>
+          <button id="clearHistoryBtn" class="button secondary">清空历史</button>
+          <button id="reloadBtn" class="button secondary">重载知识库</button>
+        </div>
       </div>
       <div id="chatMessages" class="chat-messages"></div>
       <div class="composer">
         <label class="label" for="question">输入问题</label>
-        <textarea id="question" placeholder="例如：狂战士的怒焰斩在满层怒气时倍率怎么计算？"></textarea>
+        <textarea id="question" placeholder="例如：六转系统是什么？"></textarea>
         <div class="actions">
           <button id="askBtn" class="button primary">发送</button>
           <button id="searchBtn" class="button secondary">仅检索</button>
@@ -30,6 +34,11 @@
 
     <aside class="panel side-panel">
       <div class="panel-header">
+        <h2>对话历史</h2>
+      </div>
+      <div id="historyList" class="history-list"></div>
+
+      <div class="panel-header side-header">
         <h2>知识条目</h2>
       </div>
       <div id="entries" class="entries"></div>

@@ -1,16 +1,25 @@
 const askBtn = document.getElementById("askBtn");
 const searchBtn = document.getElementById("searchBtn");
 const reloadBtn = document.getElementById("reloadBtn");
+const newChatBtn = document.getElementById("newChatBtn");
+const clearHistoryBtn = document.getElementById("clearHistoryBtn");
 const questionEl = document.getElementById("question");
 const sourcesEl = document.getElementById("sources");
 const entriesEl = document.getElementById("entries");
+const historyListEl = document.getElementById("historyList");
 const chatMessagesEl = document.getElementById("chatMessages");
 
+const STORAGE_KEY = "maplestory_qa_chat_sessions";
+const MAX_SESSIONS = 20;
+const MAX_MESSAGES_PER_SESSION = 80;
+const MAX_CONTEXT_MESSAGES = 8;
+
+let chatSessions = [];
+let activeSessionId = null;
 let currentController = null;
-const chatHistory = [];
 
 function escapeHtml(text) {
-  return text
+  return String(text)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -22,64 +31,137 @@ function renderMarkdown(text) {
   if (!window.marked) {
     return escapeHtml(text).replace(/\n/g, "<br>");
   }
-  const safe = escapeHtml(text);
-  return marked.parse(safe, { breaks: true });
+  return marked.parse(escapeHtml(text), { breaks: true });
 }
 
-async function fetchJson(url, method = "GET", body = null) {
-  const response = await fetch(url, {
-    method,
-    headers: { "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : null,
+function createId() {
+  if (window.crypto && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return Date.now().toString() + "-" + Math.random().toString(16).slice(2);
+}
+
+function formatTime(value) {
+  if (!value) return "";
+  return new Intl.DateTimeFormat("en-US", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
+function sessionTitle(session) {
+  if (!session.messages.length) {
+    return "New chat";
+  }
+  const firstUserMessage = session.messages.find(function (item) {
+    return item.role === "user" && item.content.trim();
   });
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(detail || `request failed: ${response.status}`);
+  if (!firstUserMessage) {
+    return "Conversation";
   }
-  return response.json();
+  return firstUserMessage.content.replace(/\s+/g, " ").trim().slice(0, 24);
 }
 
-function renderSources(items) {
-  if (!items.length) {
-    sourcesEl.innerHTML = '<div class="card">没有命中资料</div>';
-    return;
+function normalizeSession(session) {
+  if (!session || typeof session !== "object") return null;
+  if (!Array.isArray(session.messages)) return null;
+
+  const messages = session.messages
+    .filter(function (item) {
+      return item && typeof item === "object";
+    })
+    .map(function (item) {
+      return {
+        role: item.role,
+        content: String(item.content || ""),
+      };
+    })
+    .filter(function (item) {
+      return (item.role === "user" || item.role === "assistant") && item.content.trim();
+    });
+
+  return {
+    id: typeof session.id === "string" && session.id ? session.id : createId(),
+    title: typeof session.title === "string" && session.title ? session.title : "New chat",
+    createdAt: session.createdAt || new Date().toISOString(),
+    updatedAt: session.updatedAt || new Date().toISOString(),
+    messages: messages,
+  };
+}
+
+function loadSessions() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      chatSessions = [];
+      activeSessionId = null;
+      return;
+    }
+    const parsed = JSON.parse(raw);
+    chatSessions = Array.isArray(parsed)
+      ? parsed.map(normalizeSession).filter(Boolean)
+      : [];
+    chatSessions.sort(function (a, b) {
+      return new Date(b.updatedAt) - new Date(a.updatedAt);
+    });
+    activeSessionId = chatSessions[0] ? chatSessions[0].id : null;
+  } catch {
+    chatSessions = [];
+    activeSessionId = null;
   }
-
-  sourcesEl.innerHTML = items
-    .map(
-      (item) => `
-        <article class="card">
-          <h3>${item.title}</h3>
-          <div class="meta">类型：${item.type} | 章节：${item.section} | 来源：${item.source}</div>
-          <div class="tags">标签：${(item.tags || []).join(", ") || "无"}</div>
-          <div class="snippet">${item.text.replace(/\n/g, "<br>")}</div>
-        </article>
-      `
-    )
-    .join("");
 }
 
-function renderEntries(items) {
-  entriesEl.innerHTML = items
-    .map(
-      (item) => `
-        <article class="card">
-          <h3>${item.title}</h3>
-          <div class="meta">类型：${item.type} | 来源：${item.source}</div>
-          <div class="tags">标签：${(item.tags || []).join(", ") || "无"}</div>
-        </article>
-      `
-    )
-    .join("");
+function saveSessions() {
+  chatSessions = chatSessions
+    .map(normalizeSession)
+    .filter(Boolean)
+    .sort(function (a, b) {
+      return new Date(b.updatedAt) - new Date(a.updatedAt);
+    })
+    .slice(0, MAX_SESSIONS);
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(chatSessions));
 }
 
-function appendMessage(role, content = "") {
+function getActiveSession() {
+  return chatSessions.find(function (session) {
+    return session.id === activeSessionId;
+  }) || null;
+}
+
+function touchSession(session) {
+  session.updatedAt = new Date().toISOString();
+  session.title = sessionTitle(session);
+  chatSessions = [session].concat(chatSessions.filter(function (item) {
+    return item.id !== session.id;
+  }));
+  saveSessions();
+}
+
+function createSession() {
+  const session = {
+    id: createId(),
+    title: "New chat",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    messages: [],
+  };
+  chatSessions = [session].concat(chatSessions);
+  activeSessionId = session.id;
+  saveSessions();
+  renderHistoryList();
+  return session;
+}
+
+function appendMessage(role, content) {
   const node = document.createElement("div");
-  node.className = `message ${role}`;
+  node.className = "message " + role;
   if (role === "assistant") {
-    node.innerHTML = renderMarkdown(content);
+    node.innerHTML = renderMarkdown(content || "");
   } else {
-    node.textContent = content;
+    node.textContent = content || "";
   }
   chatMessagesEl.appendChild(node);
   chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
@@ -88,20 +170,128 @@ function appendMessage(role, content = "") {
 
 function updateMessage(node, content) {
   if (node.classList.contains("assistant")) {
-    node.innerHTML = renderMarkdown(content);
+    node.innerHTML = renderMarkdown(content || "");
   } else {
-    node.textContent = content;
+    node.textContent = content || "";
   }
   chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
 }
 
-function normalizedHistory() {
-  return chatHistory.slice(-8);
+function normalizedHistory(messages) {
+  return messages.slice(-MAX_CONTEXT_MESSAGES);
 }
 
-async function loadEntries() {
-  const data = await fetchJson("/api/entries");
-  renderEntries(data.items);
+function renderEntries(items) {
+  entriesEl.innerHTML = items.map(function (item) {
+    return [
+      '<article class="card">',
+      "<h3>" + escapeHtml(item.title) + "</h3>",
+      '<div class="meta">Type: ' + escapeHtml(item.type) + " | Source: " + escapeHtml(item.source) + "</div>",
+      '<div class="tags">Tags: ' + escapeHtml((item.tags || []).join(", ") || "none") + "</div>",
+      "</article>",
+    ].join("");
+  }).join("");
+}
+
+function renderSources(items) {
+  if (!items.length) {
+    sourcesEl.innerHTML = '<div class="card">No source matched</div>';
+    return;
+  }
+
+  sourcesEl.innerHTML = items.map(function (item) {
+    return [
+      '<article class="card">',
+      "<h3>" + escapeHtml(item.title) + "</h3>",
+      '<div class="meta">Type: ' + escapeHtml(item.type) + " | Section: " + escapeHtml(item.section) + " | Source: " + escapeHtml(item.source) + "</div>",
+      '<div class="tags">Tags: ' + escapeHtml((item.tags || []).join(", ") || "none") + "</div>",
+      '<div class="snippet">' + escapeHtml(item.text).replace(/\n/g, "<br>") + "</div>",
+      "</article>",
+    ].join("");
+  }).join("");
+}
+
+function renderWelcome() {
+  chatMessagesEl.innerHTML = "";
+  appendMessage("assistant", "Knowledge base loaded. You can start asking questions.");
+}
+
+function renderSessionMessages(session) {
+  chatMessagesEl.innerHTML = "";
+  if (!session || !session.messages.length) {
+    renderWelcome();
+    return;
+  }
+
+  session.messages.forEach(function (message) {
+    appendMessage(message.role, message.content);
+  });
+}
+
+function renderHistoryList() {
+  if (!historyListEl) {
+    return;
+  }
+
+  if (!chatSessions.length) {
+    historyListEl.innerHTML = '<div class="history-empty">No history yet</div>';
+    return;
+  }
+
+  historyListEl.innerHTML = chatSessions.map(function (session) {
+    return [
+      '<button class="history-item ' + (session.id === activeSessionId ? "active" : "") + '" data-session-id="' + session.id + '">',
+      '<div class="history-title">' + escapeHtml(session.title) + "</div>",
+      '<div class="history-meta">' + formatTime(session.updatedAt) + " · " + session.messages.length + " messages</div>",
+      "</button>",
+    ].join("");
+  }).join("");
+
+  historyListEl.querySelectorAll(".history-item").forEach(function (button) {
+    button.addEventListener("click", function () {
+      activeSessionId = button.dataset.sessionId;
+      renderSessionMessages(getActiveSession());
+      renderHistoryList();
+    });
+  });
+}
+
+function startNewChat() {
+  activeSessionId = null;
+  questionEl.value = "";
+  sourcesEl.innerHTML = "";
+  renderWelcome();
+  renderHistoryList();
+}
+
+function addMessageToSession(session, role, content) {
+  session.messages.push({ role: role, content: content });
+  if (session.messages.length > MAX_MESSAGES_PER_SESSION) {
+    session.messages = session.messages.slice(-MAX_MESSAGES_PER_SESSION);
+  }
+  touchSession(session);
+}
+
+function fetchJson(url, method, body) {
+  var options = {
+    method: method || "GET",
+    headers: { "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : null,
+  };
+  return fetch(url, options).then(function (response) {
+    if (!response.ok) {
+      return response.text().then(function (detail) {
+        throw new Error(detail || ("request failed: " + response.status));
+      });
+    }
+    return response.json();
+  });
+}
+
+function loadEntries() {
+  return fetchJson("/api/entries").then(function (data) {
+    renderEntries(data.items || []);
+  });
 }
 
 async function streamChat(question) {
@@ -109,16 +299,35 @@ async function streamChat(question) {
     currentController.abort();
   }
 
-  sourcesEl.innerHTML = "";
-  appendMessage("user", question);
-  chatHistory.push({ role: "user", content: question });
+  const userQuestion = question.trim();
+  if (!userQuestion) {
+    return;
+  }
 
-  const assistantNode = appendMessage("assistant", "正在思考...");
+  sourcesEl.innerHTML = "";
+
+  let session = getActiveSession();
+  if (!session) {
+    session = createSession();
+  }
+
+  if (
+    chatMessagesEl.childElementCount === 1 &&
+    chatMessagesEl.firstElementChild &&
+    chatMessagesEl.firstElementChild.textContent === "Knowledge base loaded. You can start asking questions."
+  ) {
+    chatMessagesEl.innerHTML = "";
+  }
+
+  appendMessage("user", userQuestion);
+  addMessageToSession(session, "user", userQuestion);
   questionEl.value = "";
 
+  const assistantNode = appendMessage("assistant", "Thinking...");
   const controller = new AbortController();
   currentController = controller;
   let answer = "";
+  let responseError = "";
   let started = false;
 
   try {
@@ -126,13 +335,14 @@ async function streamChat(question) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        question,
-        history: normalizedHistory().slice(0, -1),
+        question: userQuestion,
+        history: normalizedHistory(session.messages).slice(0, -1),
       }),
       signal: controller.signal,
     });
+
     if (!response.ok || !response.body) {
-      throw new Error(`request failed: ${response.status}`);
+      throw new Error("request failed: " + response.status);
     }
 
     const reader = response.body.getReader();
@@ -140,11 +350,11 @@ async function streamChat(question) {
     let buffer = "";
 
     while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      const chunkResult = await reader.read();
+      if (chunkResult.done) break;
+      buffer += decoder.decode(chunkResult.value, { stream: true });
 
-      while (buffer.includes("\n\n")) {
+      while (buffer.indexOf("\n\n") !== -1) {
         const index = buffer.indexOf("\n\n");
         const rawEvent = buffer.slice(0, index);
         buffer = buffer.slice(index + 2);
@@ -154,68 +364,101 @@ async function streamChat(question) {
         if (payload.type === "sources") {
           renderSources(payload.sources || []);
         } else if (payload.type === "chunk") {
-          answer += payload.content;
+          answer += payload.content || "";
           if (!started) {
             started = true;
             updateMessage(assistantNode, "");
           }
           updateMessage(assistantNode, answer);
         } else if (payload.type === "error") {
-          updateMessage(assistantNode, `请求失败：${payload.content}`);
+          responseError = payload.content || "request failed";
+          updateMessage(assistantNode, "Request failed: " + responseError);
         }
       }
     }
 
-    chatHistory.push({ role: "assistant", content: answer || "当前知识库里没有找到相关资料。" });
+    const finalAnswer = responseError ? ("Request failed: " + responseError) : (answer || "No relevant material found in the knowledge base.");
+    updateMessage(assistantNode, finalAnswer);
+    addMessageToSession(session, "assistant", finalAnswer);
   } catch (error) {
     if (error.name === "AbortError") {
-      updateMessage(assistantNode, "上一条回答已中断。");
+      updateMessage(assistantNode, "The previous answer was interrupted.");
     } else {
-      updateMessage(assistantNode, `请求失败：${error.message}`);
+      const finalAnswer = "Request failed: " + error.message;
+      updateMessage(assistantNode, finalAnswer);
+      addMessageToSession(session, "assistant", finalAnswer);
     }
   } finally {
     currentController = null;
+    renderHistoryList();
   }
 }
 
-askBtn.addEventListener("click", async () => {
-  const question = questionEl.value.trim();
-  if (!question) return;
-  await streamChat(question);
+function clearHistory() {
+  const confirmed = window.confirm("Clear all saved chat history?");
+  if (!confirmed) {
+    return;
+  }
+
+  chatSessions = [];
+  activeSessionId = null;
+  localStorage.removeItem(STORAGE_KEY);
+  renderHistoryList();
+  renderWelcome();
+}
+
+askBtn.addEventListener("click", function () {
+  streamChat(questionEl.value);
 });
 
-questionEl.addEventListener("keydown", async (event) => {
+questionEl.addEventListener("keydown", function (event) {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
-    const question = questionEl.value.trim();
-    if (!question) return;
-    await streamChat(question);
+    streamChat(questionEl.value);
   }
 });
 
-searchBtn.addEventListener("click", async () => {
+searchBtn.addEventListener("click", function () {
   const question = questionEl.value.trim();
   if (!question) return;
   appendMessage("user", question);
-  appendMessage("assistant", "已执行本地检索，请查看引用资料。");
-  try {
-    const data = await fetchJson("/api/search", "POST", { question });
-    renderSources(data.items || []);
-  } catch (error) {
-    appendMessage("assistant", `请求失败：${error.message}`);
-  }
+  appendMessage("assistant", "Local search complete. Check the sources panel.");
+  fetchJson("/api/search", "POST", { question: question })
+    .then(function (data) {
+      renderSources(data.items || []);
+    })
+    .catch(function (error) {
+      appendMessage("assistant", "Request failed: " + error.message);
+    });
 });
 
-reloadBtn.addEventListener("click", async () => {
-  appendMessage("assistant", "正在重载知识库...");
-  try {
-    await fetchJson("/api/reload", "POST");
-    await loadEntries();
-    appendMessage("assistant", "知识库已重载。");
-  } catch (error) {
-    appendMessage("assistant", `重载失败：${error.message}`);
-  }
+reloadBtn.addEventListener("click", function () {
+  appendMessage("assistant", "Reloading the knowledge base...");
+  fetchJson("/api/reload", "POST")
+    .then(function () {
+      return loadEntries();
+    })
+    .then(function () {
+      appendMessage("assistant", "Knowledge base reloaded.");
+    })
+    .catch(function (error) {
+      appendMessage("assistant", "Reload failed: " + error.message);
+    });
 });
 
-appendMessage("assistant", "知识库已加载，可以开始提问。");
+if (newChatBtn) {
+  newChatBtn.addEventListener("click", startNewChat);
+}
+
+if (clearHistoryBtn) {
+  clearHistoryBtn.addEventListener("click", clearHistory);
+}
+
+loadSessions();
+renderHistoryList();
+if (activeSessionId) {
+  renderSessionMessages(getActiveSession());
+} else {
+  renderWelcome();
+}
 loadEntries();
