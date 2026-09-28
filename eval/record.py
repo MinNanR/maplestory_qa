@@ -135,13 +135,18 @@ SNAPSHOT_SETTINGS = (
     "knowledge_max_chars",
     "knowledge_pool_max_docs",
     "llm_stream_include_usage",
+    # 工具化之后新增的行为开关：不记进 meta，两次 run 的差异就无法解释
+    # （max_tool_rounds 直接决定"模型有没有机会走到检索那一步"）
+    "max_tool_rounds",
+    "tool_timeout_s",
 )
 
 # 价目快照：只存 token、不把金额写进 span，所以单价必须随 run 一起存下来，
 # 否则历史 run 的成本无法按当时的价目复算。
 SNAPSHOT_PRICING = (
     "llm_price_input_per_mtok",
-    "llm_price_output_per_mtok",
+    "llm_price_cached_per_mtok",
+    "llm_price_output_per_mtok"
 )
 
 
@@ -164,17 +169,53 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def _tool_schema_fingerprint() -> str:
+    """全部工具定义的稳定指纹（name + description + parameters）。
+
+    build_schema() 依赖 `import backend.tool.tools_impl` 的**注册副作用**，
+    所以这里显式 import —— 否则会拿到一张空表，而空表的 hash 看起来完全"正常"，
+    是最难发现的一种失败。因此注册表为空时直接报错，不静默继续。
+    按 name 排序：注册顺序变了不该改变指纹（那只是实现细节，不是 prompt 内容）。
+    """
+    import backend.tool.tools_impl  # noqa: F401 - 触发工具注册
+    from backend.tool.dispatcher import dispatcher
+
+    schema = dispatcher.build_schema()
+    if not schema:
+        raise RuntimeError("工具注册表为空（tools_impl 的注册没有生效？）")
+    funcs = sorted(schema, key=lambda s: s["function"]["name"])
+    return json.dumps(funcs, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def prompt_hash() -> str | None:
-    """当前 prompt 的指纹。改了 prompt 之后，历史 run 的分数才解释得清。"""
+    """当前 prompt 的指纹。改了 prompt 之后，历史 run 的分数才解释得清。
+
+    组成 = 系统提示词 + **全部工具定义**。
+
+    为什么工具定义必须进指纹：工具 description 是模型做工具选择的直接依据，
+    它和 system prompt 一样是 prompt 的一部分。只 hash 系统提示词的话，
+    "改了一句工具描述、分数掉了 15%" 这种事在历史 run 里完全看不出来。
+
+    （旧版拼的是 `backend.analysis.query_analyzer.SYSTEM_PROMPT` —— 那条链路
+    已经不在编排里了，继续把它混进指纹只会让无关文件的改动污染指纹。）
+    """
     try:
-        from backend.analysis.query_analyzer import SYSTEM_PROMPT
         from backend.prompts.system import get_system_message
 
-        text = get_system_message().content + "\x00" + SYSTEM_PROMPT
+        system_text = get_system_message().content
     except Exception as e:  # noqa: BLE001 - 指纹采集失败不该影响评测
-        print(f"[WARN] 采集 prompt_hash 失败：{e}")
+        print(f"[WARN] 采集 prompt_hash 失败（系统提示词）：{e}")
         return None
-    return _sha(text)
+
+    try:
+        tools_text = _tool_schema_fingerprint()
+    except Exception as e:  # noqa: BLE001
+        # 刻意**不**降级成"只 hash 系统提示词"：那会产出一个看起来正常、
+        # 但少了一半信息的指纹，比直接失败更难发现。
+        print(f"[WARN] 采集 prompt_hash 失败（工具定义）：{e}")
+        return None
+
+    return _sha(system_text + "\x00" + tools_text)
 
 
 def code_hash() -> str | None:

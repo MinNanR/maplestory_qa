@@ -12,6 +12,13 @@
 // 当前会话 ID：清空对话时会重新生成
 let conversationId = crypto.randomUUID();
 
+/* 后端 turn.stage 的取值 -> 界面上人看的阶段名（error 事件里会带回来） */
+const STAGE_LABELS = {
+    init: "初始化",
+    generation: "生成回答",
+    tool_call: "调用工具",
+};
+
 const chat = document.getElementById("chat");
 const form = document.getElementById("chat-form");
 const input = document.getElementById("message-input");
@@ -123,7 +130,8 @@ async function sendMessage(message) {
     const cursor = document.createElement("span");
     cursor.className = "stream-cursor";
 
-    // 阶段提示：文本由后端 stage 事件驱动（“正在分析用户意图…”→“正在检索知识库…”）
+    // 阶段提示：文本由后端的 stage / tool_call / tool_result 事件共同驱动：
+    //   「思考中」→「🔍 正在调用 <工具>…」→「✅ 已返回…」→「正在生成回答…」
     const hint = document.createElement("span");
     hint.className = "thinking";
     const hintText = document.createElement("span");
@@ -171,7 +179,12 @@ async function sendMessage(message) {
 
             switch (event.type) {
                 case "stage":
-                    // start：显示该阶段的提示；end：转入下一阶段（后端暂无 generation 阶段事件）
+                    // 后端只在工具调用前后发 stage（name="tool_call"，start/end）。
+                    // start 那条要忽略：它和 tool_call 事件几乎同时到达，会用通用文案
+                    // 盖掉刚设好的「🔍 正在调用 <工具名>…」，结果工具名从来来不及显示。
+                    if (payload.name === "tool_call" && payload.state !== "end") break;
+                    // end：转入生成。后端目前没有 generation 阶段的 stage，
+                    // 这条 end 就是"工具跑完了，等模型作答"的信号。
                     setHint(payload.state === "end" ? "正在生成回答…" : payload.message || "思考中");
                     break;
 
@@ -183,15 +196,27 @@ async function sendMessage(message) {
                     scrollToBottom();
                     break;
 
-                // 台阶 2 接入工具循环后由后端产出；先按契约渲染，避免届时再改前端
                 case "tool_call":
-                    // 工具调用可能发生在已有 token 之后（hint 已被移除），需要重新挂上
+                    // 工具模式下**每一次** LLM 调用的正文都会走 token 事件，其中决策轮那段
+                    // 是模型的"过程独白"（如"我先查一下知识库的目录结构。"），不是答案的一部分。
+                    // 不清掉的话它会和最终答案粘成一段 —— 实测 71% 的轮次都有这段前导文本。
+                    // 清掉是安全的：final 事件仍会用权威答案覆盖 full。
+                    full = "";
+                    body.innerHTML = "";
+                    // hint 原本挂在 body 上，被 innerHTML 清掉后引用还在，重新挂上即可
                     if (!hint.parentNode) body.appendChild(hint);
                     setHint(`🔍 正在调用 ${payload.tool || "工具"}…`);
                     break;
 
-                case "tool_result":
+                case "tool_result": {
+                    // 工具回来了要给一条具体反馈：现在单次工具只要几十毫秒，无感；
+                    // 但接了外部搜索（秒级）之后，没有反馈就会像卡住。
+                    const ids = (payload.structured || {}).chunk_ids;
+                    const hits = Array.isArray(ids) && ids.length ? `，命中 ${ids.length} 个片段` : "";
+                    const chars = payload.chars ? `（${payload.chars} 字符）` : "";
+                    setHint(`✅ ${payload.tool || "工具"} 已返回${chars}${hits}`);
                     break;
+                }
 
                 case "final":
                     // final 携带完整答案，是权威文本（不要只依赖 token 拼接）
@@ -204,6 +229,7 @@ async function sendMessage(message) {
                     break;
 
                 default:
+                    // usage 等事件前端不消费（留给评测/观测）
                     break;
             }
         });
@@ -214,7 +240,9 @@ async function sendMessage(message) {
         if (finalText) full = finalText;
 
         if (serverError) {
-            const where = serverError.stage ? `（${serverError.stage} 阶段）` : "";
+            // stage 由后端带回来（turn.stage），映射成人看的阶段名；认不出就原样显示
+            const stageLabel = STAGE_LABELS[serverError.stage] || serverError.stage;
+            const where = stageLabel ? `（${stageLabel} 阶段）` : "";
             body.innerHTML = `<p>⚠️ 处理失败${escapeHtml(where)}：${escapeHtml(serverError.message || "未知错误")}</p>`;
             el.message.classList.add("error");
         } else if (full.trim()) {

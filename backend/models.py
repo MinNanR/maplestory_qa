@@ -1,9 +1,62 @@
-from pydantic import BaseModel, Field
-from typing import Literal
+from dataclasses import field
 
-class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant" ]
-    content: str
+from pydantic import BaseModel, Field
+from typing import Literal, Any, Union, Annotated, TypeAlias
+
+
+"""
+与大模型交互的消息封装
+"""
+#模型请求调用tool的信息
+class ToolCall(BaseModel):
+    id: str #调用id，由模型提供
+    name: str  # 调用的工具名
+    arguments: str # 调用工具的参数，是一个json字符串
+
+
+
+
+class SystemMessage(BaseModel):
+    role: Literal["system"] = "system"
+    content: str = "" 
+
+class UserMessage(BaseModel):
+    role: Literal["user"] = "user"
+    content: str = ""
+    
+    
+class AssistantMessage(BaseModel):
+    role: Literal["assistant"] = "assistant"
+    content: str | None = None
+    reasoning_content: str = ""
+    tool_calls: list[ToolCall] = Field(default_factory=list)
+    
+class ToolMessage(BaseModel):
+    role: Literal["tool"] = "tool"
+    content: str = ""
+    tool_call_id: str = ""
+    
+
+ChatMessage: TypeAlias = Annotated[
+    Union[SystemMessage, UserMessage, AssistantMessage, ToolMessage],
+    Field(discriminator="role")
+]
+
+
+class FunctionParameter(BaseModel):
+    type: str = "object"  
+    properties: dict[str, Any] = field(default_factory=dict)
+    required: list[str] = field(default_factory=list)
+    
+class ToolFunctionDefinition(BaseModel):
+    name: str
+    description: str
+    parameters: FunctionParameter
+
+class Tool(BaseModel):
+    type: str = "function"
+    function: ToolFunctionDefinition
+    
 
 
 class ChatRequest(BaseModel):

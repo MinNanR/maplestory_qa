@@ -6,5 +6,7 @@
 /.venv/
 /_raw/
 /turn/
+/.smoke_traces/
+/.smoke_traces_llm/
 /run_dir/**
 /scripts

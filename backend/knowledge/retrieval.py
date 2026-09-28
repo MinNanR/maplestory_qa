@@ -33,7 +33,12 @@ import re
 
 from backend.config import settings
 from backend.knowledge.chunker import KnowledgeChunk, split_document
-from backend.knowledge.knowledge import DEFAULT_KNOWLEDGE_DIR, KNOWLEDGE_CATALOG, get_knowledge
+from backend.knowledge.knowledge import (
+    DEFAULT_KNOWLEDGE_DIR,
+    KNOWLEDGE_CATALOG,
+    get_knowledge,
+    parse_meta_file
+)
 
 # 词元化：ASCII 字母数字整段为词元；CJK 单字为词元（配合 meta 关键词/同义词使用）
 _WORD_RE = re.compile(r"[a-zA-Z0-9]+")
@@ -55,7 +60,7 @@ class Bm25Index:
     def __init__(self, k1: float = 1.5, b: float = 0.75):
         self.k1 = k1
         self.b = b
-        self._postings: dict[str, dict[str, int]] = {}   # 词元 -> {doc_id: tf}
+        self._postings: dict[str, dict[str, int]] = {}  # 词元 -> {doc_id: tf}
         self._doc_len: dict[str, int] = {}
         self._idf: dict[str, float] = {}
         self.n_docs = 0
@@ -105,9 +110,9 @@ class Bm25Index:
 
 _DOC_INDEX: Bm25Index | None = None
 _CHUNK_INDEX: Bm25Index | None = None
-_CHUNKS: dict[str, KnowledgeChunk] = {}       # chunk_id -> chunk
-_CHUNK_OF_DOC: dict[str, list[str]] = {}      # doc_id -> [按 seq 排序的 chunk_id]
-_DOC_CHARS: dict[str, int] = {}               # doc_id -> 文档全部分块字符数
+_CHUNKS: dict[str, KnowledgeChunk] = {}  # chunk_id -> chunk
+_CHUNK_OF_DOC: dict[str, list[str]] = {}  # doc_id -> [按 seq 排序的 chunk_id]
+_DOC_CHARS: dict[str, int] = {}  # doc_id -> 文档全部分块字符数
 _FINGERPRINT: tuple[int, int] | None = None
 
 
@@ -234,6 +239,12 @@ def retrieve_chunks(
     1. 第一遍：每个传入文档至少返回其最高分片段（预算允许时），
        使历史轮次解析出的文档在后续追问中仍被注入；
     2. 第二遍：按相关分降序填充剩余预算（每文档最多 top_k 个片段）。
+
+    **返回值必须和 retrieve_chunks_in_doc 一致：list[KnowledgeChunk]。**
+    这里曾经返回 `(chunk, score)` 元组，而两个调用方（工具层、会话层）都按
+    KnowledgeChunk 用、build_knowledge_block 也只认 KnowledgeChunk ——
+    结果是 retrieval_among_document **每次调用都失败**。分数只在内部排序用，
+    调用方不需要它，所以不要往外带。
     """
     _ensure_indexes()
     if top_k is None:
@@ -282,7 +293,52 @@ def retrieve_chunks(
             selected.append(chunk_id)
             used_chars += len(_CHUNKS[chunk_id].text)
 
+    # 这里不能写成 `chunk_score[cid]`：第一遍是"每个文档至少一段"的兜底，
+    # 该片段可能对查询**零命中**（没有 score 条目），于是 [cid] 抛
+    # KeyError（错误信息就是一串 chunk_id，看着完全不像检索的问题）。
+    # 既然调用方不要分数，直接返回片段，这个坑连根去掉。
     return [_CHUNKS[cid] for cid in selected]
+
+
+def retrieve_chunks_in_doc(
+    queries: list[str],
+    doc_id: str,
+    top_k: int | None = None,
+    max_chars: int | None = None,
+) -> list[KnowledgeChunk]:
+    _ensure_indexes()
+    if top_k is None:
+        top_k = settings.chunk_top_k
+    if max_chars is None:
+        max_chars = settings.knowledge_max_chars
+
+    if doc_id not in _CHUNK_OF_DOC:
+        return []
+
+    used_chars = 0
+
+    q_tokens = []
+    for query in queries:
+        q_tokens.extend(tokenize(query))
+    chunk_score = dict(_CHUNK_INDEX.score(q_tokens))
+    
+    def rank_ids(doc_id: str) -> list[str]:
+        return sorted(
+            _CHUNK_OF_DOC[doc_id],
+            key=lambda cid: (-chunk_score.get(cid, 0.0), _CHUNKS[cid].seq),
+        )
+
+    def fits(chunk_id: str) -> bool:
+        return used_chars + len(_CHUNKS[chunk_id].text) <= max_chars
+
+    selected = []
+    for chunk_id in rank_ids(doc_id)[:top_k]:
+        if fits(chunk_id):
+            chunk = _CHUNKS[chunk_id]
+            selected.append(chunk)
+            used_chars += len(chunk.text)
+            
+    return selected
 
 
 def format_candidates(ids: list[str], max_chars: int = 3000) -> str:
@@ -328,7 +384,16 @@ def build_knowledge_block(chunks: list[KnowledgeChunk]) -> str | None:
     return "\n\n----\n\n".join(parts)
 
 
-def get_chunk_text(chunk_id: str) ->str | None:
+def build_sub_catalog(knowledge_dir: Path, max_chars: int | None = None) -> str:
+    meta = parse_meta_file(knowledge_dir)
+    ids = [e.id for e in meta.entries]
+    if max_chars is None:
+        from backend.config import settings
+        max_chars = settings.knowledge_max_chars
+    return format_candidates(ids=ids, max_chars=max_chars)
+
+
+def get_chunk_text(chunk_id: str) -> str | None:
     """按 chunk_id 取片段文本；未收录时返回 None（不要抛异常）。
 
     评测侧会对 LLM 可能产出的幻觉 id 逐个调用，抛异常会连累整轮的采集。

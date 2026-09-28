@@ -44,7 +44,8 @@ class LLMSpan:
     name: str                                  # "analysis" / "generation" / "retrieval" / "tool:xxx"
     kind: str = KIND_LLM
     span_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
-    started_at: datetime = field(default_factory=datetime.utcnow)
+    started_at: datetime = field(default_factory=datetime.now)
+    t0: float | None = None
     duration_ms: float | None = None
     error: str | None = None
 
@@ -52,17 +53,28 @@ class LLMSpan:
     model: str | None = None
     messages: list[dict[str, Any]] = field(default_factory=list)   # 实际发出去的 payload
     response: str = ""
+    reasoning_content: str | None = None   # 推理内容
     input_tokens: int | None = None
     output_tokens: int | None = None
     cached_tokens: int | None = None       # 预留：prompt cache 命中
     usage_estimated: bool = False          # 预留：provider 不给 usage 时是估算值
     ttft_ms: float | None = None           # 仅流式：首 token 延迟
     stream: bool = False
+    # 最后一次 choice 的结束原因："stop" / "tool_calls" / "length" / "content_filter"。
+    # 这是判断"模型是想调工具还是想回答"的唯一可靠依据：
+    #   - 拿到 tool_calls 但 finish_reason 不是 "tool_calls" → 流被截断，工具参数可能不完整；
+    #   - finish_reason 是 "length" → 上下文或 max_tokens 不够，答案/参数被切掉。
+    # None = provider 没给（流式下由带 choices 的尾块携带；usage 尾块 choices 为空，不带它）。
+    finish_reason: str | None = None
     attempt: int = 1                       # 预留：重试
     parent_span_id: str | None = None      # 预留：多 agent / 工具由某次调用触发
 
     # —— retrieval / tool 专属 ——
     detail: dict[str, Any] = field(default_factory=dict)
+    
+    # tool 专属
+    tool_output: str | None = None
+    
 
     @property
     def total_tokens(self) -> int | None:
@@ -156,8 +168,13 @@ class TurnTrace:
                     "model": s.model,
                     "input_tokens": s.input_tokens,
                     "output_tokens": s.output_tokens,
+                    # provider 报的 prompt cache 命中量。**input_tokens 已经包含它**，
+                    # 所以成本必须按 (input - cached) 计全价、cached 计缓存价；
+                    # 少了这个字段，评测算成本时只能把命中部分按全价算（上界）。
+                    "cached_tokens": s.cached_tokens,
                     "duration_ms": s.duration_ms,
                     "ttft_ms": s.ttft_ms,
+                    "finish_reason": s.finish_reason,
                     "usage_estimated": s.usage_estimated,
                     "error": s.error,
                     "detail": s.detail,
@@ -204,6 +221,8 @@ def print_turn_trace(trace: TurnTrace | None) -> None:
             bits.append(f"in={s.input_tokens} out={s.output_tokens}")
             if s.ttft_ms is not None:
                 bits.append(f"ttft={s.ttft_ms:.0f}ms")
+            if s.finish_reason:
+                bits.append(f"finish={s.finish_reason}")
         if s.detail:
             bits.append(str(s.detail))
         if s.error:

@@ -7,10 +7,18 @@
 两种运行方式都支持：
     python -m eval.runner     # 从仓库根目录
     python eval/runner.py     # 任意目录
+
+用例选择（调试期的关键能力，全量一轮要十几分钟，单条只要几秒）：
+    python -m eval.runner                                   # 全量
+    python -m eval.runner --case job-adele-hexa              # 单条（可重复传）
+    python -m eval.runner --pattern "eval/case/negative.jsonl"   # 整类
+    python -m eval.runner --limit 3                         # 只录前 N 条
+    python -m eval.runner --usage                           # 联调：验证流式 usage 能采到
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import re
 import sys
@@ -31,12 +39,14 @@ from backend.agent.orchestrator import (  # noqa: E402
     ErrorPayload,
     FinalPayload,
     Orchestrator,
-    StagePayload,
+    ToolCallPayload,
+    ToolResultPayload,
     UsagePayload,
 )
 from backend.conversation.manager import ConversationManager  # noqa: E402
 from backend.knowledge.retrieval import get_chunk_text  # noqa: E402
 from backend.llm.client import LLMClient  # noqa: E402
+from backend.tool.tools_impl.knowledge import RETRIEVAL_TOOL_NAMES  # noqa: E402
 
 from eval.case import Case, load_cases, validate_cases  # noqa: E402
 from eval.record import (  # noqa: E402
@@ -61,7 +71,22 @@ def safe_name(name: str) -> str:
 def collect_turn(
     query: str, events: list[AgentEvent], turn_idx: int, t0: float, ttft_ms: float | None
 ) -> TurnRecord:
-    """把一轮的事件流压成结构化事实。"""
+    """把一轮的事件流压成结构化事实。
+
+    证据口径（工具模式下唯一正确的来源）：
+      - did_retrieve   ← 本轮是否发起过检索类工具调用（tool_call 事件）
+      - injected_*_ids ← 工具**实际返回**的片段 id
+                         （tool_result 事件的 structured["chunk_ids"]）
+
+    注意分层：dispatcher 只透传 structured、不认识任何键；"chunk_ids 是知识检索的
+    证据键、且能从它派生出文档级召回"这条领域知识**属于评测层**（它本来就是知识问答
+    评测器）。所以将来接外部搜索时，dispatcher 和编排器一行都不用改，
+    只需要在下面加一条对应键的采集规则。
+
+    刻意不再从 stage 事件里读 retrieval_result：那条链路属于已删除的管道模式，
+    它现在永远不会触发，而失败形态是"指标全线归零、报告却一字不差"——
+    是这份评测里最容易被误读的一种错。
+    """
     request_id, answer, error = "", "", None
     injected_chunk_ids: list[str] = []
     injected_doc_ids: list[str] = []
@@ -73,13 +98,18 @@ def collect_turn(
             payload: FinalPayload = event.payload
             answer = payload.text
             request_id = payload.request_id
-        elif event.type == "stage":
-            payload: StagePayload = event.payload
-            if payload.name == "retrieval":
+        elif event.type == "tool_call":
+            payload: ToolCallPayload = event.payload
+            if payload.tool in RETRIEVAL_TOOL_NAMES:
                 did_retrieve = True
-                if payload.state == "end":
-                    injected_chunk_ids = list(payload.stage_context.get("retrieval_result") or [])
-                    injected_doc_ids = sorted({cid.split("#")[0] for cid in injected_chunk_ids})
+        elif event.type == "tool_result":
+            payload: ToolResultPayload = event.payload
+            # structured 由工具自报，可能根本没有这个键（目录类工具、失败路径）
+            chunk_ids = (payload.structured or {}).get("chunk_ids") or []
+            # 保序去重：多次调用/多关键词可能返回同一片段
+            for cid in chunk_ids:
+                if cid not in injected_chunk_ids:
+                    injected_chunk_ids.append(cid)
         elif event.type == "usage":
             payload: UsagePayload = event.payload
             usage = {
@@ -95,6 +125,7 @@ def collect_turn(
 
     # 注入片段的文本：录制自带证据，之后改锚点/加指标不必重跑 LLM。
     chunk_texts = [t for cid in injected_chunk_ids if (t := get_chunk_text(cid))]
+    injected_doc_ids = sorted({cid.split("#")[0] for cid in injected_chunk_ids})
 
     return TurnRecord(
         turn_idx=turn_idx,
@@ -148,9 +179,94 @@ async def run_case(
     return turns, None
 
 
-async def run(run_result_folder: str = "./run_dir") -> RunRecord:
-    cases = load_cases()
+def select_cases(
+    all_cases: list[Case],
+    *,
+    case_ids: list[str] | None = None,
+    limit: int | None = None,
+) -> tuple[list[Case], list[str]]:
+    """按 --case / --limit 从已加载的用例里筛选。
 
+    返回 (选中的用例, 没匹配上的 case id)。没匹配上必须回报：`--case` 拼错一个字母
+    就会静默录一条空 run —— 那是"没有结果"被当成"结果为空"，最难发现的一种错。
+
+    --pattern 不在这里处理：它是"从哪些文件加载"，由 load_cases 的 glob 参数负责。
+    同一件事只留一处实现，否则两处过滤条件迟早会分歧。
+    """
+    cases = all_cases
+    unmatched: list[str] = []
+
+    if case_ids:
+        wanted = set(case_ids)
+        by_id = {c.id: c for c in cases}
+        unmatched = [cid for cid in case_ids if cid not in by_id]
+        cases = [c for c in cases if c.id in wanted]
+
+    if limit is not None:
+        cases = cases[: max(0, limit)]
+
+    return cases, unmatched
+
+
+def run_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m eval.runner",
+        description="评测录制：驱动 Orchestrator 跑用例并落盘（打分见 eval.metrics）。",
+    )
+    parser.add_argument(
+        "--case", action="append", default=None, metavar="CASE_ID",
+        help="只录指定 case id（可重复传，与 --pattern/--limit 叠加）",
+    )
+    parser.add_argument(
+        "--pattern", default=None, metavar="GLOB",
+        help="用例文件 glob，默认 eval/case/*.jsonl",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None, metavar="N",
+        help="最多录前 N 条（按加载顺序）",
+    )
+    parser.add_argument(
+        "--run-dir", default="./run_dir", metavar="DIR",
+        help="录制根目录（默认 ./run_dir）",
+    )
+    parser.add_argument(
+        "--usage", action="store_true",
+        help="联调小工具：验证流式 usage 能不能采到（走真实 API，会花钱）",
+    )
+    return parser
+
+
+async def run(
+    run_result_folder: str = "./run_dir",
+    *,
+    pattern: str | None = None,
+    case_ids: list[str] | None = None,
+    limit: int | None = None,
+) -> RunRecord:
+    loaded = load_cases(pattern) if pattern else load_cases()
+
+    cases, unmatched = select_cases(
+        loaded, case_ids=case_ids, limit=limit
+    )
+    if unmatched:
+        print(f"[WARN] --case 里有 {len(unmatched)} 个 id 没匹配到：{unmatched}")
+    if not cases:
+        # 关键守卫：静默录一条空 run 比报错难查得多
+        sample = ", ".join(sorted(c.id for c in loaded)[:8])
+        print(
+            f"选中的用例数为 0（可用 case 共 {len(loaded)} 条）。"
+            f"检查 --case 的拼写 / --pattern / --limit；例如：{sample} ..."
+        )
+        sys.exit(2)
+    if len(cases) < len(loaded):
+        print(f"用例筛选：{len(cases)}/{len(loaded)} 条")
+        print(
+            "[WARN] 这是子集录制：总体均值不能与全量 run 直接对比"
+            "（逐轮明细里那几行仍然可比）"
+        )
+
+    # 校验在筛选**之后**做：--case 的意义是"聚焦一条快速迭代"，
+    # 不该被另一条无关用例的锚点问题挡住。全量 run 仍然是完整的发布闸门。
     problems = validate_cases(cases)
     if problems:
         print(f"评测集非法，共 {len(problems)} 个问题：")
@@ -235,12 +351,19 @@ async def test_usage() -> None:
               "（或 settings.llm_stream_include_usage 被关掉了）")
 
 
-async def main() -> None:
-    await run(run_result_folder="./run_dir")
+async def main(argv: list[str] | None = None) -> int:
+    args = run_arg_parser().parse_args(argv)
+    if args.usage:
+        await test_usage()
+        return 0
+    await run(
+        run_result_folder=args.run_dir,
+        pattern=args.pattern,
+        case_ids=args.case,
+        limit=args.limit,
+    )
+    return 0
 
 
 if __name__ == "__main__":
-    if "--usage" in sys.argv:
-        asyncio.run(test_usage())
-    else:
-        asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))
