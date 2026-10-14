@@ -48,6 +48,7 @@ class LLMSpan:
     t0: float | None = None
     duration_ms: float | None = None
     error: str | None = None
+    step: int | None = None # 执行轮次
 
     # —— llm 专属 ——
     model: str | None = None
@@ -111,6 +112,7 @@ class TurnTrace:
     request_id: str
     conversation_id: str
     spans: list[LLMSpan] = field(default_factory=list)
+    finish_reason: str | None = ""
 
     def start_span(self, name: str, kind: str = KIND_LLM, **kw) -> LLMSpan:
         """创建 span 并**立即挂上**（先挂后填）。
@@ -183,6 +185,17 @@ class TurnTrace:
             ],
         }
 
+
+@dataclass
+class TurnContext:
+    conversation_id: str
+    request_id: str
+    answer: str = ""
+    stage: str = "init"
+    finished: bool = False
+    finish_reason: str | None = ""
+    trace: TurnTrace | None = None
+    interrupted: bool = False
 
 @contextmanager
 def span_timer(span: LLMSpan):

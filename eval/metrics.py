@@ -46,6 +46,17 @@ class TurnVerdict:
     # retrieval_ok=False 有两种成因，归因时必须区分，否则会把"多调了"报成"少调了"。
     expected_no_retrieval: bool = False
 
+    # 本轮的收口原因（编排器写的 finish_reason）：
+    #   no_tool_calls = 自然收尾（模型自己决定不再要工具）
+    #   steps_exhausted / chars_exhausted / wall_clock = 预算触顶、提前收口
+    # None = 旧录制（该字段是后加的）或该轮没走到收口。
+    finish_reason: str | None = None
+
+    # 多跳用例的过程期望：该轮**至少**要发起几次工具调用（0 = 该轮没有这个期望）。
+    # min_tool_calls_met 为 None 时不算进均值 —— 分母只在"考了多跳"的轮上。
+    min_tool_calls: int = 0
+    min_tool_calls_met: bool | None = None
+
     # token / 成本（None = 未知，不要与 0 混）
     llm_calls: int | None = None
     input_tokens: int | None = None
@@ -91,7 +102,26 @@ class TurnVerdict:
             return False
         if self.retrieval_ok is False:
             return False
+        if self.min_tool_calls_met is False:
+            # "该多跳却单跳"：答案可能是蒙对的，但它没有走多步推理。
+            # 这是**过程**级断言（区别于结果级的 contain），所以单独判失败。
+            return False
+        if self.min_tool_calls and self.doc_recall is not None and self.doc_recall < 1.0:
+            # 多跳用例的判据是"两篇文档真的都取到了"，而不是"调了两次工具"。
+            # 为什么必须在这里判：多跳题的 must_contain 项常常在第一跳文档里就能
+            # 命中（校验器的可达性检查是"任一期望文档可达"），于是 contain_pass
+            # 无法证明第二跳发生过 —— 只能靠 doc_recall 把这一条钉住。
+            return False
         return True
+
+    @property
+    def budget_wrapped(self) -> bool:
+        """本轮是否**因预算触顶**而提前收口。
+
+        必须把 "no_tool_calls"（自然收尾）排除掉：它不是预算问题，
+        混进来这一格就失去意义。旧录制里是 None，同样按"非预算"处理。
+        """
+        return bool(self.finish_reason) and self.finish_reason != "no_tool_calls"
 
 
 @dataclass
@@ -121,6 +151,8 @@ class Summary:
     tool_turns: int = 0  # 至少调过一次工具的轮数
     deduped_total: int = 0  # 被去重拦下的调用总数
     estimated_turns: int = 0  # token 是估算值的轮数
+    budget_wrapped_turns: int = 0  # 因预算触顶提前收口的轮数（含通过与否）
+    min_tool_calls_met: float | None = None  # 多跳达成率（只在声明了该期望的轮上算）
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +164,7 @@ def _tool_stats(spans: list[dict]) -> dict:
     """从 span 摘要里派生工具指标。
 
     数据来源是编排器写进 tool span 的 detail：
-        detail.tool_call_request = {tool_call_id, name, params, max_output_chars}
+        detail.tool_call_request = {tool_call_id, name, params}
         detail.tool_call_result  = {succeeded, deduped, chars_count, structured, ...}
     刻意不在 TurnRecord 上加字段：录制只存原始 spans，指标在打分时派生 ——
     这样"改口径 / 加指标"仍然不需要重跑 LLM，旧录制也能直接重算。
@@ -226,6 +258,13 @@ def judge(case_snapshot: dict, turn_record: TurnRecord) -> TurnVerdict:
 
     tools = _tool_stats(turn_record.spans)
 
+    # 多跳期望：至少发起几次工具调用。tools["calls"] 统计的是**发起**次数
+    # （被去重的那次也算发起）—— 语义正是"模型有没有真的多走一步"。
+    min_tool_calls = int(expect_info.get("expect_min_tool_calls") or 0)
+    min_tool_calls_met = (
+        None if min_tool_calls <= 0 else tools["calls"] >= min_tool_calls
+    )
+
     # prompt cache 命中量：逐 span 汇总。全都没有这个字段时记 None（未知），
     # 不要与"命中 0"混 —— "provider 没报" 和 "一次都没命中" 是两件事。
     cached_vals = [
@@ -251,6 +290,9 @@ def judge(case_snapshot: dict, turn_record: TurnRecord) -> TurnVerdict:
         tags=list(case_snapshot.get("tags") or []),
         reason=turn_record.error or "",
         expected_no_retrieval=bool(expect_info.get("expect_no_retrieval")),
+        finish_reason=turn_record.finish_reason,
+        min_tool_calls=min_tool_calls,
+        min_tool_calls_met=min_tool_calls_met,
         llm_calls=turn_record.llm_calls,
         input_tokens=turn_record.input_tokens,
         cached_tokens=sum(cached_vals) if cached_vals else None,
@@ -454,6 +496,8 @@ def aggregate(verdicts: list[TurnVerdict], category: str = "") -> Summary:
         tool_turns=sum(1 for v in verdicts if v.tool_calls),
         deduped_total=sum(v.tool_deduped for v in verdicts),
         estimated_turns=sum(1 for v in verdicts if v.usage_estimated),
+        budget_wrapped_turns=sum(1 for v in verdicts if v.budget_wrapped),
+        min_tool_calls_met=mean_of(verdicts, "min_tool_calls_met"),
     )
 
 
@@ -508,6 +552,16 @@ def _bucket(v: TurnVerdict) -> str | None:
     if v.reason == "not_run":
         # 根本没执行：它既没有检索也没有答案，不能算进任何诊断格
         return "未执行（被前轮中断）"
+    if not v.passed and v.budget_wrapped:
+        # **成因级**标签，必须排在所有症状级判定之前。
+        # 预算触顶导致的失败，模型可能只是没机会再取一次证据 —— 把它归进
+        # "证据齐但答案没用上（生成问题）"会直接指错方向（001 §5 那条坑的同款）。
+        # 通过的轮不贴这个标签：它没暴露问题，贴了只会让矩阵变吵。
+        return "预算收口（可能因此证据不足）"
+    if not v.passed and v.min_tool_calls_met is False:
+        # 同样是"成因/过程级"标签：答案可能蒙对，但没有走多步推理。
+        # 排在症状级判定之前 —— 它解释的是"为什么这轮不算过"。
+        return "该多跳却单跳（工具调用不足）"
     if v.contain_pass is None:
         return None
     if v.bad_hits:
@@ -640,6 +694,36 @@ def render(
     out.append(
         f"    样本数 n={summary.count}（p95 在 n<20 时就是最大值，别当分位数读）"
     )
+    # 预算归因：只在本录制真的带 finish_reason 时才报数 —— 否则 "0" 会被读成
+    # "没有预算收口"，而真相是"这个字段当时还不存在"（旧录制）。
+    if any(v.finish_reason is not None for v in turn_verdicts):
+        out.append(
+            _row(
+                [
+                    ("预算收口轮数（触顶提前收口）", 34, False),
+                    (str(summary.budget_wrapped_turns), 8, True),
+                    (f" / n={summary.count}", 0, False),
+                ]
+            )
+        )
+    else:
+        out.append(
+            "    预算收口轮数：--（本录制没有 finish_reason 字段：录制于该字段加入之前）"
+        )
+
+    # 多跳达成率：只在**声明了 expect_min_tool_calls 的轮**上算（分母不是全部轮）。
+    # 它是过程指标：答案可能蒙对，但没走多步推理就是没走。
+    if summary.min_tool_calls_met is not None:
+        multi_turns = [v for v in turn_verdicts if v.min_tool_calls_met is not None]
+        out.append(
+            _row(
+                [
+                    ("多跳达成率（>=N 次工具调用）", 34, False),
+                    (_ratio(summary.min_tool_calls_met), 8, True),
+                    (f" n={len(multi_turns)}", 0, False),
+                ]
+            )
+        )
     out.append("")
 
     # 2) 按 category
@@ -922,7 +1006,8 @@ def render(
     # 8) 仍然缺的东西要显式说明，不要静默给 0
     out.append("")
     out.append(
-        "【暂缺】工具输出被截断的量（max_output_chars 尚未生效）；"
+        "【暂缺】工具输出被截断的量（单次上限由各工具自己的默认预算决定，"
+        "调度层不介入，因此被裁掉多少目前不可知）；"
         "检索内部的候选打分过程没有独立 span（已计入工具耗时的 detail）"
     )
     out.append(line)

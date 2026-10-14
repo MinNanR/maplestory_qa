@@ -44,6 +44,7 @@ class TurnRecord:
     output_tokens: int | None = None
     usage_estimated: bool = False          # 有 span 的 token 是估算值
     spans: list[dict] = field(default_factory=list)   # 每 span 摘要（name/kind/tokens/duration）
+    finish_reason: str | None = None  # 终止原因（budget / no_tool_calls / over_budget / user_cancel）
 
 
 @dataclass
@@ -109,6 +110,7 @@ def load_run(path: str | Path) -> RunRecord:
                         output_tokens=t.get("output_tokens"),
                         usage_estimated=bool(t.get("usage_estimated")),
                         spans=list(t.get("spans") or []),
+                        finish_reason=t.get("finish_reason"),
                     )
                     for t in c.get("turns", [])
                 ],
@@ -139,6 +141,12 @@ SNAPSHOT_SETTINGS = (
     # （max_tool_rounds 直接决定"模型有没有机会走到检索那一步"）
     "max_tool_rounds",
     "tool_timeout_s",
+    "max_tool_chars",
+    "max_chars_per_tool_call",
+    "max_wall_s",
+    "answer_turns_projection",
+    "max_tool_chars_projection",
+    "max_prompt_chars",
 )
 
 # 价目快照：只存 token、不把金额写进 span，所以单价必须随 run 一起存下来，

@@ -23,11 +23,19 @@ const chat = document.getElementById("chat");
 const form = document.getElementById("chat-form");
 const input = document.getElementById("message-input");
 const sendBtn = document.getElementById("send-btn");
+const stopBtn = document.getElementById("stop-btn");
 const clearBtn = document.getElementById("clear-btn");
 const sessionBadge = document.getElementById("session-badge");
 const welcomeEl = document.getElementById("welcome");
 
 let streaming = false;
+
+// 本轮请求的取消句柄 + "是不是用户按了停止"。
+// 停止的实现是 abort 掉 fetch：连接一断，服务端就会收到 CancelledError，
+// 标记 interrupted、落 trace，并（在投影层）把半截的工具组整组丢弃 ——
+// 所以前端不需要等任何"确认停止"的事件，本地立刻收尾即可。
+let activeController = null;
+let stoppedByUser = false;
 
 /* ---------- Markdown 配置 ---------- */
 if (window.marked) {
@@ -119,6 +127,150 @@ function addMessage(role, content = "") {
     return { message, bubble, body: bubble.querySelector(".markdown-body") };
 }
 
+/* ---------- 执行过程时间线（让 agent 循环看得见） ---------- */
+
+/** 工具参数是 JSON 字符串：只截一小段给人看，长文本交给 CSS 省略号。 */
+function shortArgs(args) {
+    if (!args) return "";
+    const text = typeof args === "string" ? args : JSON.stringify(args);
+    return text.length > 80 ? text.slice(0, 80) + "…" : text;
+}
+
+/**
+ * 步骤时间线：把 tool_call / tool_result / stage 三类事件渲染成
+ * 「第 N 步 · 调用了什么 · 回来了多少」。
+ *
+ * 为什么挂在 bubble 上而不是 markdown-body 里：正文每次 token 都会整块重渲染
+ * （body.innerHTML = ...），挂在里面会被反复清掉 —— 老代码的 hint 就得手动
+ * 重新 append 才能活下来。
+ *
+ * 没有工具调用的普通回答**不会**显示这块（只有出现步骤行才 show）。
+ */
+function createTracker(bubble) {
+    const wrap = document.createElement("div");
+    wrap.className = "steps";
+    wrap.hidden = true;
+
+    const head = document.createElement("div");
+    head.className = "steps-head";
+    const title = document.createElement("span");
+    title.className = "steps-title";
+    title.textContent = "执行过程";
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "steps-toggle";
+    toggle.textContent = "收起";
+    toggle.addEventListener("click", () => {
+        const collapsed = wrap.classList.toggle("collapsed");
+        toggle.textContent = collapsed ? "展开" : "收起";
+    });
+    head.appendChild(title);
+    head.appendChild(toggle);
+
+    const list = document.createElement("div");
+    list.className = "steps-list";
+
+    const status = document.createElement("div");
+    status.className = "steps-status";
+    status.textContent = "思考中…";
+
+    wrap.appendChild(head);
+    wrap.appendChild(list);
+    wrap.appendChild(status);
+    bubble.insertBefore(wrap, bubble.firstChild);
+
+    const rows = new Map();     // step -> { row, items }
+    const pending = new Map();  // 工具名 -> [chip, ...]（LIFO：结果贴回最近一次调用）
+
+    function show() {
+        wrap.hidden = false;
+    }
+
+    function rowFor(step) {
+        show();
+        const key = step || 1;
+        if (!rows.has(key)) {
+            const row = document.createElement("div");
+            row.className = "step-row";
+            const no = document.createElement("span");
+            no.className = "step-no";
+            no.textContent = `第 ${key} 步`;
+            const items = document.createElement("div");
+            items.className = "step-items";
+            row.appendChild(no);
+            row.appendChild(items);
+            list.appendChild(row);
+            rows.set(key, { row, items });
+        }
+        return rows.get(key);
+    }
+
+    return {
+        setStatus(text) {
+            // 只更新文字，不 show：普通回答不该因为"生成中"就冒出时间线
+            status.textContent = text;
+        },
+        /** 决策轮的过程独白：留着比丢掉好（丢掉要靠 final 覆盖，留着可复盘）。 */
+        addThought(step, text) {
+            const { items } = rowFor(step);
+            const div = document.createElement("div");
+            div.className = "step-thought";
+            div.textContent = text;
+            items.appendChild(div);
+        },
+        addToolCall(p) {
+            const { items } = rowFor(p.step);
+            const chip = document.createElement("div");
+            chip.className = "tool-chip";
+            const name = document.createElement("span");
+            name.className = "tool-name";
+            name.textContent = `🔍 ${p.tool || "工具"}`;
+            const args = document.createElement("span");
+            args.className = "tool-args";
+            args.textContent = shortArgs(p.args);
+            chip.appendChild(name);
+            chip.appendChild(args);
+            items.appendChild(chip);
+            const key = p.tool || "";
+            if (!pending.has(key)) pending.set(key, []);
+            pending.get(key).push(chip);
+        },
+        addToolResult(p) {
+            const queue = pending.get(p.tool || "") || [];
+            const chip = queue.pop();
+            if (!chip) return;
+            const ids = (p.structured || {}).chunk_ids;
+            const hits = Array.isArray(ids) && ids.length ? ` · 命中 ${ids.length} 片段` : "";
+            const chars = p.chars ? ` · ${p.chars} 字符` : "";
+            // succeeded 是后端显式给的（失败也要回灌一条 tool 消息）——
+            // 不要去嗅探 result 的文案前缀
+            const failed = p.succeeded === false;
+            chip.classList.add(failed ? "failed" : "done");
+            const meta = document.createElement("span");
+            meta.className = "tool-meta";
+            meta.textContent = failed ? "❌ 失败" : `✅${chars}${hits}`;
+            chip.appendChild(meta);
+        },
+        summary() {
+            let tools = 0;
+            rows.forEach(({ items }) => {
+                tools += items.querySelectorAll(".tool-chip").length;
+            });
+            return rows.size ? `共 ${rows.size} 步 · 调用工具 ${tools} 次` : "";
+        },
+        finish(note, collapse = true) {
+            if (wrap.hidden) return;   // 没发生过工具调用 → 这块不该出现
+            status.textContent = note || "完成";
+            if (collapse) {
+                wrap.classList.add("collapsed");
+                toggle.textContent = "展开";
+            }
+            const s = this.summary();
+            if (s) title.textContent = `执行过程 · ${s}`;
+        },
+    };
+}
+
 /* ---------- 流式请求 ---------- */
 
 async function sendMessage(message) {
@@ -126,37 +278,25 @@ async function sendMessage(message) {
 
     const el = addMessage("assistant");
     const body = el.body || el.bubble;
+    const tracker = createTracker(el.bubble);
 
     const cursor = document.createElement("span");
     cursor.className = "stream-cursor";
-
-    // 阶段提示：文本由后端的 stage / tool_call / tool_result 事件共同驱动：
-    //   「思考中」→「🔍 正在调用 <工具>…」→「✅ 已返回…」→「正在生成回答…」
-    const hint = document.createElement("span");
-    hint.className = "thinking";
-    const hintText = document.createElement("span");
-    hintText.textContent = "思考中";
-    const dots = document.createElement("span");
-    dots.className = "dots";
-    for (let i = 0; i < 3; i++) {
-        const dot = document.createElement("span");
-        dot.className = "dot";
-        dots.appendChild(dot);
-    }
-    hint.appendChild(hintText);
-    hint.appendChild(dots);
-    body.appendChild(hint);
-
-    const setHint = (text) => {
-        hintText.textContent = text || "思考中";
-    };
+    body.appendChild(cursor);
 
     streaming = true;
+    stoppedByUser = false;
     sendBtn.disabled = true;
+    stopBtn.hidden = false;
+
+    const controller = new AbortController();
+    activeController = controller;
 
     let full = "";            // 累积的 token，仅用于边收边渲染
     let finalText = "";       // final 事件里的权威完整答案
+    let finishReason = null;  // 收口原因：no_tool_calls / steps_exhausted / ...
     let serverError = null;   // 后端通过 error 事件报的错（不是网络异常）
+    let aborted = false;      // 后端发过 aborted（服务端侧中断）
     let gotFinal = false;
 
     try {
@@ -168,6 +308,7 @@ async function sendMessage(message) {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ conversation_id: conversationId, message }),
+            signal: controller.signal,
         });
 
         if (!response.ok || !response.body) {
@@ -179,49 +320,46 @@ async function sendMessage(message) {
 
             switch (event.type) {
                 case "stage":
-                    // 后端只在工具调用前后发 stage（name="tool_call"，start/end）。
-                    // start 那条要忽略：它和 tool_call 事件几乎同时到达，会用通用文案
-                    // 盖掉刚设好的「🔍 正在调用 <工具名>…」，结果工具名从来来不及显示。
-                    if (payload.name === "tool_call" && payload.state !== "end") break;
-                    // end：转入生成。后端目前没有 generation 阶段的 stage，
-                    // 这条 end 就是"工具跑完了，等模型作答"的信号。
-                    setHint(payload.state === "end" ? "正在生成回答…" : payload.message || "思考中");
+                    // 现在 generation 阶段有显式起止了（以前只能靠 tool_call 的 end 猜）
+                    if (payload.name === "generation") {
+                        tracker.setStatus(payload.state === "start" ? "生成中…" : "本轮生成结束");
+                    } else if (payload.name === "tool_call") {
+                        tracker.setStatus(payload.state === "start" ? "执行工具…" : "工具执行完毕");
+                    }
                     break;
 
                 case "token":
                     full += payload.text || "";
-                    hint.remove();
                     body.innerHTML = renderMarkdown(full);
                     body.appendChild(cursor);
                     scrollToBottom();
                     break;
 
                 case "tool_call":
-                    // 工具模式下**每一次** LLM 调用的正文都会走 token 事件，其中决策轮那段
-                    // 是模型的"过程独白"（如"我先查一下知识库的目录结构。"），不是答案的一部分。
-                    // 不清掉的话它会和最终答案粘成一段 —— 实测 71% 的轮次都有这段前导文本。
-                    // 清掉是安全的：final 事件仍会用权威答案覆盖 full。
+                    // 决策轮的正文是"过程独白"（不是答案）。老做法是直接丢掉，
+                    // 这里改进：收进时间线，正文清空（final 仍是权威答案）。
+                    if (full.trim()) tracker.addThought(payload.step, full.trim());
                     full = "";
                     body.innerHTML = "";
-                    // hint 原本挂在 body 上，被 innerHTML 清掉后引用还在，重新挂上即可
-                    if (!hint.parentNode) body.appendChild(hint);
-                    setHint(`🔍 正在调用 ${payload.tool || "工具"}…`);
+                    body.appendChild(cursor);
+                    tracker.addToolCall(payload);
+                    tracker.setStatus(`正在调用 ${payload.tool || "工具"}…`);
                     break;
 
-                case "tool_result": {
-                    // 工具回来了要给一条具体反馈：现在单次工具只要几十毫秒，无感；
-                    // 但接了外部搜索（秒级）之后，没有反馈就会像卡住。
-                    const ids = (payload.structured || {}).chunk_ids;
-                    const hits = Array.isArray(ids) && ids.length ? `，命中 ${ids.length} 个片段` : "";
-                    const chars = payload.chars ? `（${payload.chars} 字符）` : "";
-                    setHint(`✅ ${payload.tool || "工具"} 已返回${chars}${hits}`);
+                case "tool_result":
+                    tracker.addToolResult(payload);
+                    tracker.setStatus(`${payload.tool || "工具"} 已返回`);
                     break;
-                }
 
                 case "final":
                     // final 携带完整答案，是权威文本（不要只依赖 token 拼接）
                     finalText = payload.text || "";
+                    finishReason = payload.finish_reason || null;
                     gotFinal = true;
+                    break;
+
+                case "aborted":
+                    aborted = true;
                     break;
 
                 case "error":
@@ -234,10 +372,10 @@ async function sendMessage(message) {
             }
         });
 
-        hint.remove();
         cursor.remove();
-
         if (finalText) full = finalText;
+
+        const stopped = stoppedByUser || aborted;
 
         if (serverError) {
             // stage 由后端带回来（turn.stage），映射成人看的阶段名；认不出就原样显示
@@ -245,30 +383,70 @@ async function sendMessage(message) {
             const where = stageLabel ? `（${stageLabel} 阶段）` : "";
             body.innerHTML = `<p>⚠️ 处理失败${escapeHtml(where)}：${escapeHtml(serverError.message || "未知错误")}</p>`;
             el.message.classList.add("error");
+            tracker.finish("失败", false);   // 失败时展开过程，便于排查
         } else if (full.trim()) {
             body.innerHTML = renderMarkdown(full);
-            if (!gotFinal) {
-                // 流在 final 之前就结束了：回答可能被截断，明确告知而不是静默接受
+            if (stopped || !gotFinal) {
+                // 明确告知"这是半截答案"，而不是静默接受
                 const note = document.createElement("p");
                 note.className = "stream-note";
-                note.textContent = "（连接中断，以上回答可能不完整）";
+                note.textContent = stopped
+                    ? "（已停止生成，以上为已收到的部分）"
+                    : "（连接中断，以上回答可能不完整）";
                 body.appendChild(note);
             }
             attachCopyButtons(body);
+            tracker.finish(
+                stopped ? "已停止" : finishReason ? `收口原因：${finishReason}` : "完成"
+            );
             scrollToBottom(true);
+        } else if (stopped) {
+            body.innerHTML = "<p>（已停止，尚未生成内容）</p>";
+            tracker.finish("已停止");
         } else {
             body.innerHTML = "<p>（无回复内容）</p>";
+            tracker.finish("无输出");
         }
     } catch (err) {
-        hint.remove();
         cursor.remove();
-        body.innerHTML = `<p>⚠️ ${escapeHtml(err.message || "网络异常，请稍后重试")}</p>`;
-        el.message.classList.add("error");
+        if (stoppedByUser || (err && err.name === "AbortError")) {
+            // 用户主动停止：保留已收到的内容，绝不能报成"网络异常"
+            if (finalText) full = finalText;
+            if (full.trim()) {
+                body.innerHTML = renderMarkdown(full);
+                const note = document.createElement("p");
+                note.className = "stream-note";
+                note.textContent = "（已停止生成，以上为已收到的部分）";
+                body.appendChild(note);
+                attachCopyButtons(body);
+            } else {
+                body.innerHTML = "<p>（已停止，尚未生成内容）</p>";
+            }
+            tracker.finish("已停止");
+        } else {
+            body.innerHTML = `<p>⚠️ ${escapeHtml(err.message || "网络异常，请稍后重试")}</p>`;
+            el.message.classList.add("error");
+            tracker.finish("失败", false);
+        }
     } finally {
         streaming = false;
+        activeController = null;
         sendBtn.disabled = false;
+        stopBtn.hidden = true;
         input.focus();
     }
+}
+
+/**
+ * 停止生成：abort 掉 fetch。
+ *
+ * 不依赖后端再回一个"已停止"事件 —— 连接断了就送不到了。服务端的收尾
+ * （标记 interrupted、落 trace、投影丢弃半截工具组）由断连本身触发。
+ */
+function stopStreaming() {
+    if (!activeController) return;
+    stoppedByUser = true;
+    activeController.abort();
 }
 
 /* ---------- 代码块复制按钮 ---------- */
@@ -313,7 +491,8 @@ function attachCopyButtons(container) {
 /* ---------- 清空对话 ---------- */
 
 async function clearConversation() {
-    if (streaming) return;
+    // 正在流式时点"清空"：先把这一轮停掉，而不是静默无反应
+    if (streaming) stopStreaming();
 
     const confirmed = window.confirm(
         "确定要清空当前对话吗？\n清空后将开启一个全新的会话。"
@@ -382,6 +561,7 @@ document.querySelectorAll(".chip").forEach((chip) => {
 });
 
 clearBtn.addEventListener("click", clearConversation);
+stopBtn.addEventListener("click", stopStreaming);
 
 /* ---------- 初始化 ---------- */
 

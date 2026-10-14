@@ -404,6 +404,150 @@ body {
     color: var(--text-muted);
 }
 
+/* ---------- 执行过程时间线（agent 循环可见化） ---------- */
+
+.steps {
+    margin: 0 0 12px;
+    padding: 10px 12px;
+    border: 1px solid rgba(99, 102, 241, 0.18);
+    background: rgba(99, 102, 241, 0.04);
+    border-radius: var(--radius-md);
+    font-size: 13px;
+}
+
+/* hidden 属性要显式压住，避免将来给 .steps 加 display 时把它顶掉 */
+.steps[hidden] { display: none; }
+
+.steps-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    color: var(--text-secondary);
+    font-weight: 600;
+}
+
+.steps-title {
+    font-size: 12.5px;
+    letter-spacing: 0.02em;
+}
+
+.steps-toggle {
+    border: none;
+    background: transparent;
+    color: var(--accent-strong);
+    font-size: 12px;
+    padding: 2px 6px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+}
+
+.steps-toggle:hover { background: rgba(99, 102, 241, 0.08); }
+
+.steps-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.steps.collapsed .steps-list,
+.steps.collapsed .steps-status { display: none; }
+
+.step-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+}
+
+.step-no {
+    flex: 0 0 auto;
+    margin-top: 1px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: rgba(99, 102, 241, 0.1);
+    color: var(--accent-strong);
+    font-size: 11.5px;
+    white-space: nowrap;
+}
+
+.step-items {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+}
+
+/* 决策轮的过程独白：灰一点、加一条竖线，和"工具结果"区分开 */
+.step-thought {
+    padding-left: 8px;
+    border-left: 2px solid rgba(99, 102, 241, 0.25);
+    color: var(--text-muted);
+    font-size: 12.5px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+
+.tool-chip {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+    padding: 4px 8px;
+    border: 1px solid rgba(15, 23, 42, 0.08);
+    border-radius: var(--radius-sm);
+    background: #ffffff;
+    box-shadow: var(--shadow-sm);
+}
+
+.tool-chip.done { border-color: rgba(16, 185, 129, 0.35); }
+.tool-chip.failed {
+    border-color: rgba(239, 68, 68, 0.35);
+    background: rgba(239, 68, 68, 0.04);
+}
+
+.tool-name {
+    flex: 0 0 auto;
+    color: var(--text-primary);
+    font-size: 12.5px;
+    font-weight: 600;
+}
+
+.tool-args {
+    flex: 1 1 auto;
+    min-width: 0;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tool-meta {
+    flex: 0 0 auto;
+    color: var(--text-secondary);
+    font-size: 11.5px;
+}
+
+.tool-chip.failed .tool-meta { color: var(--danger); }
+
+.steps-status {
+    margin-top: 8px;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+/* 停止按钮：只在流式期间出现（hidden 由 JS 切换） */
+.btn-stop {
+    border: 1px solid rgba(239, 68, 68, 0.25);
+    background: rgba(239, 68, 68, 0.1);
+    color: var(--danger);
+}
+
+.btn-stop:hover { background: rgba(239, 68, 68, 0.16); }
+
 /* ---------- Markdown 渲染 ---------- */
 .markdown-body {
     line-height: 1.75;

@@ -34,6 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from backend.config import settings  # noqa: E402
 from backend.agent.orchestrator import (  # noqa: E402
     AgentEvent,
     ErrorPayload,
@@ -92,12 +93,14 @@ def collect_turn(
     injected_doc_ids: list[str] = []
     did_retrieve = False
     usage: dict = {}
+    finish_reason: str | None = None
 
     for event in events:
         if event.type == "final":
             payload: FinalPayload = event.payload
             answer = payload.text
             request_id = payload.request_id
+            finish_reason = payload.finish_reason
         elif event.type == "tool_call":
             payload: ToolCallPayload = event.payload
             if payload.tool in RETRIEVAL_TOOL_NAMES:
@@ -144,6 +147,7 @@ def collect_turn(
         output_tokens=usage.get("output_tokens"),
         usage_estimated=bool(usage.get("usage_estimated")),
         spans=list(usage.get("spans") or []),
+        finish_reason=finish_reason,
     )
 
 
@@ -230,6 +234,10 @@ def run_arg_parser() -> argparse.ArgumentParser:
         help="录制根目录（默认 ./run_dir）",
     )
     parser.add_argument(
+        "--max-tool-rounds", type=int, default=None, metavar="N",
+        help="覆盖 settings.max_tool_rounds（L5 对照实验：传 1 = 近似单跳基线）",
+    )
+    parser.add_argument(
         "--usage", action="store_true",
         help="联调小工具：验证流式 usage 能不能采到（走真实 API，会花钱）",
     )
@@ -242,7 +250,15 @@ async def run(
     pattern: str | None = None,
     case_ids: list[str] | None = None,
     limit: int | None = None,
+    max_tool_rounds: int | None = None,
 ) -> RunRecord:
+    if max_tool_rounds is not None:
+        # L5 对照实验：只改这一个开关，其余全部保持默认。
+        # settings 会写进 meta（SNAPSHOT_SETTINGS 含 max_tool_rounds），
+        # 所以两次 run 的差异可解释 —— 这正是它们可比的前提。
+        settings.max_tool_rounds = max_tool_rounds
+        print(f"[对照实验] max_tool_rounds = {max_tool_rounds}（已覆盖配置）")
+
     loaded = load_cases(pattern) if pattern else load_cases()
 
     cases, unmatched = select_cases(
@@ -361,6 +377,7 @@ async def main(argv: list[str] | None = None) -> int:
         pattern=args.pattern,
         case_ids=args.case,
         limit=args.limit,
+        max_tool_rounds=args.max_tool_rounds,
     )
     return 0
 

@@ -35,7 +35,8 @@ SYSTEM_PROMPT = """
 """
 
 WRAP_UP_NOTE="""
-系统提示：本轮工具调用次数已达上限。请基于已经获得的信息直接给出最终答案；
+系统提示：当前模型已无调用工具预算，用尽原因：{reason}。
+请基于已经获得的信息直接给出最终答案；
 不要再请求调用工具，也不要输出工具调用的格式。
 """
 
@@ -44,5 +45,5 @@ def get_system_message() -> SystemMessage:
     return SystemMessage(role="system", content=SYSTEM_PROMPT)
 
 
-def get_wrap_up_note() -> UserMessage:
-    return UserMessage(role="user", content=WRAP_UP_NOTE)
+def get_wrap_up_note(reason: str = "no_tool_calls") -> UserMessage:
+    return UserMessage(role="user", content=WRAP_UP_NOTE.format(reason=reason))

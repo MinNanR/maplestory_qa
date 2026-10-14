@@ -11,6 +11,7 @@ from backend.knowledge.retrieval import (
     build_knowledge_block,
     build_sub_catalog
 )
+from backend.config import settings
 import json
 
 # 会"检索知识库"的工具名集合。
@@ -45,7 +46,7 @@ def read_knowledge_catalog() -> str:
 
 
 @dispatcher.register
-def read_knowledge_sub_catalog(folder: str) -> str:
+def read_knowledge_sub_catalog(folder: str, max_chars: int | None = settings.max_chars_per_tool_call) -> str:
     """查看某个分类下的知识条目清单（条目 id、标题、描述、关键词）。
 
     何时用：已经知道大致分类，但不确定该读哪一篇具体文档时。
@@ -59,11 +60,11 @@ def read_knowledge_sub_catalog(folder: str) -> str:
         folder (string): 分类文件夹名，必须原样取自 read_knowledge_catalog 返回的 folder 字段，不要自己拼写或猜测
     """
     dir = DEFAULT_KNOWLEDGE_DIR / folder / "meta.md"
-    return build_sub_catalog(dir)
+    return build_sub_catalog(dir, max_chars=max_chars)
 
 
 @dispatcher.register
-def retrieval_in_document(doc_id: str, retrieval_texts: list[str]) -> ToolOutput:
+def retrieval_in_document(doc_id: str, retrieval_texts: list[str], max_chars: int | None = settings.max_chars_per_tool_call) -> ToolOutput:
     """在**一个**指定文档内部，按关键词检回相关原文片段。
 
     何时用：已经拿到确切的 doc_id，需要该文档中与问题相关的原文
@@ -77,7 +78,7 @@ def retrieval_in_document(doc_id: str, retrieval_texts: list[str]) -> ToolOutput
         doc_id (string): 目标文档 id，必须原样取自目录工具返回的条目 id，不要自己拼写、猜测或改写
         retrieval_texts (list[string]): 1~3 个具体关键词（技能英文名、系统名、数值项），多个关键词会合并打分；不要把用户的整句问题当关键词传入
     """
-    chunks = retrieve_chunks_in_doc(retrieval_texts, doc_id)
+    chunks = retrieve_chunks_in_doc(retrieval_texts, doc_id, max_chars=max_chars)
 
     if chunks:
         # chunk_ids 走 structured：只给观测/评测用，不进 text
@@ -90,7 +91,7 @@ def retrieval_in_document(doc_id: str, retrieval_texts: list[str]) -> ToolOutput
 
 
 @dispatcher.register
-def retrieval_among_document(doc_ids: list[str], retrieval_text: str) -> ToolOutput:
+def retrieval_among_document(doc_ids: list[str], retrieval_text: str, max_chars: int | None = settings.max_chars_per_tool_call) -> ToolOutput:
     """在多个指定文档中，按**一个**关键词检回相关原文片段（用于跨文档横向比较）。
 
     何时用：需要在 2 篇以上文档之间对比同一主题时，例如比较两个职业的同类技能、
@@ -105,7 +106,7 @@ def retrieval_among_document(doc_ids: list[str], retrieval_text: str) -> ToolOut
         doc_ids (list[string]): 目标文档 id 列表（2 篇以上），每个 id 都必须原样取自目录工具返回的条目 id
         retrieval_text (string): **一个**关键词字符串（技能英文名、系统名），不要传整句问题，也不要传数组
     """
-    chunks = retrieve_chunks(retrieval_text, doc_ids)
+    chunks = retrieve_chunks(retrieval_text, doc_ids, max_chars=max_chars)
 
     if chunks:
         return ToolOutput(

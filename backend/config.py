@@ -11,7 +11,13 @@ class Settings(BaseSettings):
     llm_model: str = "deepseek-flash"
     top_k: int = 10
     max_tool_rounds: int = 8
+    max_chars_per_tool_call: int = 6000  # 单个工具调用字符上限
+    max_tool_chars: int = 60_000  # 单轮工具调用总字符上限
+    max_tool_chars_projection: int = 100_000  # 投影后工具调用总字符上限
+    max_prompt_chars: int = 102_400  # 投影后正文总预算（硬上限）
+    max_wall_s: int = 180  # 有效工具时间 = max_wall_s − 15（收口保留）
     tool_timeout_s: int = 20
+    answer_turns_projection: int = 6
 
     # 知识库检索与注入相关配置
     knowledge_dir: str = "knowledge"  # 知识库根目录（相对仓库根）

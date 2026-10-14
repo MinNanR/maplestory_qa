@@ -43,7 +43,13 @@ EXPECT_FIELDS = (
     "must_contain",
     "must_contain_any",
     "must_not_contain",
+    # 该轮至少要发起几次工具调用（0 = 不断言）。多跳用例用它把"单跳也能蒙对"区分开。
+    # 它是 EXPECT_FIELDS 里**唯一**的整数型字段，所以解析要单独走 _as_int。
+    "expect_min_tool_calls",
 )
+
+INT_EXPECT_FIELDS = ("expect_min_tool_calls",)
+LIST_EXPECT_FIELDS = tuple(f for f in EXPECT_FIELDS if f not in INT_EXPECT_FIELDS)
 
 
 @dataclass
@@ -59,6 +65,8 @@ class TurnExpect:
     must_not_contain: list[str] = field(default_factory=list)
     # 不该检索的轮（超范围/闲聊）：断言 did_retrieve 为 False
     expect_no_retrieval: bool = False
+    # 至少要发起几次工具调用（0 = 不断言）。多跳用例靠它断言"过程"而不只是"结果"。
+    expect_min_tool_calls: int = 0
 
 
 @dataclass
@@ -84,6 +92,21 @@ def _as_str_list(value, where: str) -> list[str]:
     return list(value)
 
 
+def _as_int(value, where: str) -> int:
+    """整数型期望字段的解析。
+
+    刻意**不接受**字符串 "2" 或布尔 true：把 2 写成 "2"、把 3 写成 true 都是笔误，
+    静默转换会让用例带着一个"看起来生效了"的错期望一路跑下去。
+    """
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{where} 必须是整数，实际是 {type(value).__name__}：{value!r}")
+    if value < 0:
+        raise ValueError(f"{where} 不能为负：{value}")
+    return value
+
+
 def _build_turn(query, raw_turn: dict, where: str) -> TurnExpect:
     if not isinstance(raw_turn, dict):
         raise ValueError(f"{where} 必须是对象，实际是 {type(raw_turn).__name__}")
@@ -93,7 +116,12 @@ def _build_turn(query, raw_turn: dict, where: str) -> TurnExpect:
         raise ValueError(f"{where} 含未知字段：{sorted(unknown)}（可用：{sorted(known)}）")
     return TurnExpect(
         query=query,
-        **{f: _as_str_list(raw_turn.get(f), f"{where}.{f}") for f in EXPECT_FIELDS},
+        # 只对**列表型**字段做列表解析：expect_min_tool_calls 送进 _as_str_list 会
+        # 在加载期直接报类型错（"必须是字符串列表，实际是 int"）。
+        **{f: _as_str_list(raw_turn.get(f), f"{where}.{f}") for f in LIST_EXPECT_FIELDS},
+        expect_min_tool_calls=_as_int(
+            raw_turn.get("expect_min_tool_calls"), f"{where}.expect_min_tool_calls"
+        ),
         expect_no_retrieval=bool(raw_turn.get("expect_no_retrieval", False)),
     )
 
@@ -294,6 +322,25 @@ def validate_cases(cases: list[Case]) -> list[str]:
                         fatal.append(
                             f"{where}: {field_name} 项在期望文档里不可达（用例永红）: {s!r}"
                         )
+
+    # 4) multi_hop 的语义校验：这一类用例存在的意义就是"单跳解不了"。
+    #    塞进一条单跳题不会报错，但会把"多跳达成率"稀释掉 —— 指标还在，
+    #    结论却变成"循环没用"。所以在加载期就挡住。
+    for case in cases:
+        if case.category != "multi_hop":
+            continue
+        for i, turn in enumerate(case.turns):
+            if len(turn.expect_doc_ids) < 2:
+                fatal.append(
+                    f"{case.id} turn{i}: multi_hop 用例必须声明 >=2 个 expect_doc_ids"
+                    f"（当前 {len(turn.expect_doc_ids)}；expect_doc_ids_any 不算 —— "
+                    "多跳要求「两篇都必须命中」）"
+                )
+            if turn.expect_min_tool_calls < 2:
+                fatal.append(
+                    f"{case.id} turn{i}: multi_hop 用例必须声明 expect_min_tool_calls >= 2"
+                    f"（当前 {turn.expect_min_tool_calls}）"
+                )
 
     return fatal
 

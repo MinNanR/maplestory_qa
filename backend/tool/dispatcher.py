@@ -10,7 +10,6 @@ class ToolCallRequest:
     tool_call_id: str = ""
     name: str = ""
     params: str = "{}"
-    max_output_chars: int = 4000
 
 
 @dataclass
@@ -111,6 +110,11 @@ class ToolDispatcher:
         parameters_input = {
             p: parameters_json[p] for p in properties.keys() if p in parameters_json
         }
+        # 这里**不**做任何预算注入：单次输出预算由各工具自己的默认预算决定
+        # （知识检索是 settings.knowledge_max_chars），调度层不参与。
+        # 曾经有过"dispatcher 给工具塞 max_chars"的隐式约定，代价是每个工具都必须
+        # 记得声明这个参数，忘一个就在运行期变成 TypeError（而报错看起来像参数写错）；
+        # 模型硬塞的同名参数也会在这里被 properties 过滤丢掉 —— 它不在 schema 里。
         raw = func(**parameters_input)
         # 三种返回形状归一到一个契约上：
         #   ToolOutput → text + structured
